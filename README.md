@@ -144,6 +144,41 @@ rclone lsf 'mydrive:ColabDownloads'
 rclone lsf 'mydrive:ColabChunkDownloads/your-file'
 ```
 
+### 4. Use the domain-fronting `rclone` fork when needed
+
+If direct access to Google Drive or Google APIs is filtered on your network, you can use the domain-fronting fork at `https://github.com/aleskxyz/rclone`.
+
+The simplest way to build it is:
+
+```bash
+git clone https://github.com/aleskxyz/rclone
+cd rclone
+go build
+```
+
+Then run the same `copy` commands as above, but add the fronting flags.
+
+Important flags:
+
+- `--fronting-enable`: turns on domain fronting in the shared HTTP transport.
+- `--fronting-target google.com`: uses `google.com` as the network dial target.
+- `--fronting-sni google.com`: sets TLS SNI to `google.com`. If you omit it, the fork already defaults SNI to `--fronting-target`.
+- `--fronting-domains '*.googleapis.com,drive.google.com'`: fronts only matching logical request hosts. Exact hostnames and `*.` wildcards are supported; unmatched hosts are left alone.
+
+Example:
+
+```bash
+./rclone copy 'mydrive:ColabDownloads' ./ColabDownloads -P \
+  --fronting-enable \
+  --fronting-target google.com \
+  --fronting-sni google.com \
+  --fronting-domains '*.googleapis.com,*.google.com,*.googleusercontent.com'
+```
+
+Use the same flags with the chunked-folder commands from the previous steps if you are downloading `ColabChunkDownloads` instead.
+
+Whether domain fronting works depends on your current network path and Google's current edge behavior.
+
 ## Option 2: Download from a shared link with `gdrivedl`
 
 Use `gdrivedl` when you prefer to download from a Google Drive share link instead of authenticating `rclone` against your own Drive.
@@ -213,6 +248,31 @@ Notes:
 - For resumable downloads and some metadata lookups, `gdrivedl` also supports `--apikey` or `GDRIVEDL_APIKEY`.
 - Project repo: `https://github.com/hadi77ir/gdrivedl`
 
+### 5. Use domain fronting with `gdrivedl`
+
+`gdrivedl` also supports domain fronting. To use `google.com` as the fronting target, add these flags:
+
+- `--fronting-enable`
+- `--fronting-target google.com`
+- `--fronting-sni google.com`
+
+Example:
+
+```bash
+gdrivedl \
+  --fronting-enable \
+  --fronting-target google.com \
+  --fronting-sni google.com \
+  --utls-profile firefox_auto \
+  -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+```
+
+The same fronting flags also work for shared-folder downloads.
+
+Unlike the `rclone` fork above, `gdrivedl` does not use a `--fronting-domains` filter; once enabled, fronting applies to requests made through its shared transport.
+
+Whether domain fronting works depends on your current network path and Google's current edge behavior.
+
 ## Rebuilding files after you download them locally
 
 ### Rebuild parts from `ColabDownloader.py`
@@ -242,6 +302,7 @@ The chunk numbers are zero-padded, so normal alphabetical order is the correct r
 ## Practical advice
 
 - Prefer `rclone` if the output stays private in your own Drive.
+- If you need domain fronting with `google.com`, use `gdrivedl` or the `https://github.com/aleskxyz/rclone` fork.
 - Prefer `gdrivedl` if you want a clean shared-link download workflow for a file or folder.
 - For very large downloads, `ColabChunkedDownloader.py` is the safer workflow because each run only handles one Drive-sized batch.
 - Do not rename part or chunk files unless you preserve their ordering.
