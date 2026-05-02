@@ -1,0 +1,251 @@
+[English](README.md)
+
+# ColabDownloader
+
+این مخزن شامل اسکریپت‌های مستقل برای Google Colab است که یک فایل را از یک URL دانلود می‌کنند و سپس آن را داخل Google Drive کپی می‌کنند.
+
+در این مخزن دو روش وجود دارد:
+
+- `ColabDownloader.py`: فایل را دانلود می‌کند و آن را یا به‌صورت یک فایل واحد، یا به‌صورت چند فایل بزرگ با نام‌های `.part####` داخل Drive قرار می‌دهد.
+- `ColabChunkedDownloader.py`: فایل را به تعداد زیادی chunk کوچک تقسیم می‌کند و آن‌ها را در پوشه‌های `split_####` قرار می‌دهد تا انتقال مرحله‌ای از Colab به Drive راحت‌تر شود.
+
+## کدام اسکریپت مناسب‌تر است؟
+
+- وقتی ساده‌ترین مسیر را می‌خواهید و سرور مبدأ از HTTP Range پشتیبانی می‌کند، از `ColabDownloader.py` استفاده کنید.
+- وقتی فایل خیلی بزرگ است و می‌خواهید آن را در چند مرحله‌ی حدود `10 GB` از طریق Drive جابه‌جا کنید، از `ColabChunkedDownloader.py` استفاده کنید.
+
+## اجرای اسکریپت‌ها در Google Colab
+
+این اسکریپت‌ها مخصوص Colab نوشته شده‌اند و خودشان با `drive.mount("/content/drive")` گوگل‌درایو را mount می‌کنند.
+
+### مراحل کلی
+
+1. یک نوت‌بوک جدید در `https://colab.research.google.com/` باز کنید.
+2. محتوای کامل `ColabDownloader.py` یا `ColabChunkedDownloader.py` را داخل یک سلول کد کپی کنید.
+3. تنظیمات ابتدای فایل را ویرایش کنید.
+4. سلول را اجرا کنید.
+5. وقتی Colab درخواست دسترسی به Google Drive داد، آن را تأیید کنید.
+6. پیام‌ها و پرسش‌های خود اسکریپت را دنبال کنید.
+
+### تنظیمات مهم در `ColabDownloader.py`
+
+- `URL`: آدرس مستقیم فایلی که باید دانلود شود.
+- `DRIVE_OUTPUT_DIR`: مسیر ذخیره‌ی فایل یا partها در Google Drive.
+- `LOCAL_WORK_DIR`: مسیر موقت داخل ماشین Colab.
+- `MAX_SINGLE_FILE_BYTES`: مرز بین حالت فایل واحد و حالت چند part.
+- `PART_SIZE_BYTES`: اندازه‌ی هر فایل `.part####`.
+
+مسیر پیش‌فرض خروجی:
+
+```python
+DRIVE_OUTPUT_DIR = "/content/drive/MyDrive/ColabDownloads"
+```
+
+### تنظیمات مهم در `ColabChunkedDownloader.py`
+
+- `URL`: آدرس مستقیم فایلی که باید دانلود شود.
+- `SPLIT_PART_INDEX`: مشخص می‌کند در این اجرا کدام batch ساخته شود.
+- `DRIVE_OUTPUT_ROOT`: پوشه‌ی ریشه در Google Drive برای batchها.
+- `LOCAL_WORK_ROOT`: مسیر موقت داخل ماشین Colab.
+- `CHUNK_SIZE_BYTES`: اندازه‌ی هر chunk.
+- `MAX_LOCAL_BATCH_BYTES`: بیشترین حجم محلی هر batch قبل از اجرای batch بعدی.
+
+مسیر پیش‌فرض خروجی:
+
+```python
+DRIVE_OUTPUT_ROOT = "/content/drive/MyDrive/ColabChunkDownloads"
+```
+
+## هر اسکریپت چه چیزی را داخل Google Drive آپلود می‌کند؟
+
+### `ColabDownloader.py`
+
+- اگر فایل مبدأ `10 GiB` یا کوچک‌تر باشد، یک فایل واحد داخل `DRIVE_OUTPUT_DIR` قرار می‌دهد.
+- اگر فایل از `MAX_SINGLE_FILE_BYTES` بزرگ‌تر باشد، آن را به partهایی با نام‌هایی مثل `filename.part0001-of-0004` تقسیم می‌کند.
+- بعد از آپلود partهای انتخاب‌شده، فایل `filename.manifest.json` را هم آپلود می‌کند.
+- این manifest شامل نام فایل اصلی، اندازه‌ی اصلی، تعداد partها و ترتیب بازسازی است.
+
+حالت فایل‌های بزرگ نیاز دارد که سرور مبدأ از HTTP Range پشتیبانی کند تا Colab بتواند هر part را جداگانه دانلود کند و از بایت `0` دوباره شروع نکند.
+
+### `ColabChunkedDownloader.py`
+
+- هر اجرا فقط یک `SPLIT_PART_INDEX` را پردازش می‌کند.
+- با تنظیمات پیش‌فرض، هر split شامل حداکثر `1000` chunk با اندازه‌ی `10 MB` است؛ یعنی حدود `10 GB` در هر batch.
+- خروجی Drive در مسیری مانند زیر ساخته می‌شود:
+
+```text
+/content/drive/MyDrive/ColabChunkDownloads/<safe_filename>/split_0001
+```
+
+- داخل این پوشه فایل‌های chunk و همین‌طور یک manifest برای همان split قرار می‌گیرد؛ مثل `filename.split_0001.manifest.json`.
+- بعد از پایان آپلود، اسکریپت مکث می‌کند تا آن پوشه‌ی Drive را دانلود یا بررسی کنید و بعد سراغ split بعدی بروید.
+
+چرخه‌ی معمول برای فایل‌های خیلی بزرگ:
+
+1. `SPLIT_PART_INDEX = 1` را تنظیم کنید.
+2. سلول را اجرا کنید و صبر کنید تا آپلود روی Drive تمام شود.
+3. پوشه‌ی ایجادشده در Drive را با `rclone` یا `gdrivedl` روی سیستم خودتان دانلود کنید.
+4. به Colab برگردید، تأیید کنید، سپس `SPLIT_PART_INDEX = 2` را بگذارید.
+5. این روند را تا پایان همه‌ی splitها تکرار کنید.
+
+## دانلود فایل‌های آپلودشده از Google Drive بعد از پایان اجرای Colab
+
+دو روش عملی دارید:
+
+- `rclone`: بهترین گزینه برای دانلود مستقیم از Google Drive شخصی خودتان.
+- `gdrivedl`: بهترین گزینه وقتی می‌خواهید با لینک اشتراکی Google Drive دانلود انجام دهید.
+
+## روش اول: دانلود از Google Drive با `rclone`
+
+وقتی فایل‌ها هنوز در `MyDrive` شخصی شما هستند و نمی‌خواهید آن‌ها را عمومی کنید، `rclone` بهترین انتخاب است.
+
+### 1. ساخت remote برای Google Drive
+
+بعد از نصب `rclone` این دستور را اجرا کنید:
+
+```bash
+rclone config
+```
+
+یک remote مثلا با نام `mydrive` بسازید، نوع آن را `drive` انتخاب کنید و مراحل OAuth را در مرورگر کامل کنید.
+
+### 2. دانلود خروجی `ColabDownloader.py`
+
+اگر پوشه‌ی پیش‌فرض را تغییر نداده‌اید:
+
+```bash
+rclone copy 'mydrive:ColabDownloads' ./ColabDownloads -P
+```
+
+برای دانلود فقط یک فایل یا یک part مشخص:
+
+```bash
+rclone copy 'mydrive:ColabDownloads/your-file.part0001-of-0004' . -P
+```
+
+### 3. دانلود خروجی `ColabChunkedDownloader.py`
+
+برای دانلود یک پوشه‌ی split:
+
+```bash
+rclone copy 'mydrive:ColabChunkDownloads/your-file/split_0001' ./split_0001 -P
+```
+
+برای دانلود کل ساختار chunkها:
+
+```bash
+rclone copy 'mydrive:ColabChunkDownloads/your-file' ./your-file -P
+```
+
+چند دستور کمکی:
+
+```bash
+rclone lsf 'mydrive:ColabDownloads'
+rclone lsf 'mydrive:ColabChunkDownloads/your-file'
+```
+
+## روش دوم: دانلود با لینک اشتراکی و `gdrivedl`
+
+وقتی می‌خواهید به‌جای اتصال مستقیم `rclone` به Drive شخصی خودتان، دانلود را با لینک اشتراکی انجام دهید، از `gdrivedl` استفاده کنید.
+
+نکات مهم:
+
+- `gdrivedl` با لینک‌های اشتراکی Google Drive کار می‌کند.
+- اگر فایل فقط در `MyDrive` خصوصی شماست و share نشده، بهتر است از `rclone` استفاده کنید.
+- برای استفاده از `gdrivedl` باید فایل یا پوشه‌ی خروجی را از داخل Drive با حالت `Anyone with the link` و دسترسی `Viewer` به اشتراک بگذارید.
+
+### 1. اشتراک‌گذاری فایل یا پوشه‌ی آپلودشده در Drive
+
+در Google Drive:
+
+1. روی فایل یا پوشه‌ی مورد نظر راست‌کلیک کنید.
+2. گزینه‌ی `Share` را بزنید.
+3. سطح دسترسی را روی `Anyone with the link` قرار دهید.
+4. مجوز را روی `Viewer` نگه دارید.
+5. لینک ایجادشده را کپی کنید.
+
+### 2. نصب یا build کردن `gdrivedl`
+
+اگر مخزن همسایه‌ای که برای این پروژه اشاره شده را دارید:
+
+```bash
+cd ../gdrivedl
+go build
+```
+
+بعد آن را به این شکل اجرا کنید:
+
+```bash
+./gdrivedl -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing'
+```
+
+یا مستقیماً آن را نصب کنید:
+
+```bash
+go install github.com/hadi77ir/gdrivedl@latest
+```
+
+### 3. دانلود پوشه‌ی اشتراکیِ خروجی `ColabChunkedDownloader.py`
+
+پوشه‌های عمومی share شده را می‌توان مستقیم دانلود کرد:
+
+```bash
+gdrivedl -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing'
+```
+
+این روش برای پوشه‌های `split_0001`، `split_0002` و بقیه‌ی batchها بسیار مناسب است.
+
+### 4. دانلود فایل اشتراکی یا partهای خروجی `ColabDownloader.py`
+
+```bash
+gdrivedl -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
+```
+
+برای فایل‌های خیلی بزرگ، حالت resumable مفید است:
+
+```bash
+gdrivedl -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' -r 100m
+```
+
+نکته‌ها:
+
+- برای پوشه‌های عمومی اشتراکی، API key لازم نیست.
+- برای دانلود resumable و بعضی metadata lookupها، `gdrivedl` از `--apikey` یا `GDRIVEDL_APIKEY` هم پشتیبانی می‌کند.
+- مخزن پروژه: `https://github.com/hadi77ir/gdrivedl`
+
+## بازسازی فایل بعد از دانلود روی سیستم خودتان
+
+### بازسازی partهای `ColabDownloader.py`
+
+بعد از دانلود همه‌ی فایل‌های `.part####` و فایل manifest، آن‌ها را داخل یک پوشه قرار دهید و به ترتیب به هم بچسبانید.
+
+در Linux یا macOS:
+
+```bash
+cat your-file.part0001-of-0004 your-file.part0002-of-0004 your-file.part0003-of-0004 your-file.part0004-of-0004 > your-file
+```
+
+اگر درباره‌ی ترتیب مطمئن نبودید، از فایل `*.manifest.json` استفاده کنید.
+
+### بازسازی chunkهای `ColabChunkedDownloader.py`
+
+بعد از دانلود همه‌ی پوشه‌های `split_####`، همه‌ی chunkها را داخل یک مسیر قرار دهید و فایل اصلی را بازسازی کنید.
+
+در Linux یا macOS:
+
+```bash
+cat your-file.chunk*-of-00001234 > your-file
+```
+
+شماره‌ی chunkها با صفر از چپ پر شده است، پس ترتیب الفبایی همان ترتیب صحیح بازسازی است.
+
+## توصیه‌های عملی
+
+- اگر خروجی در Drive شخصی شما خصوصی می‌ماند، `rclone` بهترین انتخاب است.
+- اگر می‌خواهید دانلود را با لینک اشتراکی انجام دهید، `gdrivedl` گزینه‌ی تمیزتری است.
+- برای فایل‌های خیلی بزرگ، `ColabChunkedDownloader.py` امن‌تر است چون هر اجرا فقط یک batch هم‌اندازه با Drive را مدیریت می‌کند.
+- فایل‌های part و chunk را تغییر نام ندهید، مگر اینکه ترتیب آن‌ها را دقیق حفظ کنید.
+
+## مجوز استفاده
+
+MIT
