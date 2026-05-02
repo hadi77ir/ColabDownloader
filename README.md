@@ -9,10 +9,17 @@ This repo contains two workflows:
 - `ColabDownloader.py`: downloads one file and uploads it to Drive as either a single file or a few large `.part####` files.
 - `ColabChunkedDownloader.py`: downloads one file as many small chunk files, grouped into `split_####` folders that are sized for repeated Colab-to-Drive batches.
 
+It also contains two `yt-dlp`-based variants:
+
+- `ColabYTDownloader.py`: downloads one media item with `yt-dlp`, then uploads it to Drive as either a single file or a few large `.part####` files.
+- `ColabChunkedYTDownloader.py`: downloads one media item with `yt-dlp`, then uploads it to Drive as chunk files grouped into `split_####` folders.
+
 ## Which script should you use?
 
 - Use `ColabDownloader.py` when you want the simplest workflow and the source server supports HTTP Range requests.
 - Use `ColabChunkedDownloader.py` when the file is very large and you want to move it through Drive in repeated batches of about `10 GB` each.
+- Use `ColabYTDownloader.py` when the source is a video or media page supported by `yt-dlp` and you want a single-file-or-parts workflow.
+- Use `ColabChunkedYTDownloader.py` when the source is a video or media page supported by `yt-dlp` and you want Drive chunk folders.
 
 ## Running the scripts in Google Colab
 
@@ -21,11 +28,13 @@ These scripts are already written for Colab and mount Google Drive themselves wi
 ### Basic steps
 
 1. Open a new notebook at `https://colab.research.google.com/`.
-2. Copy the full contents of either `ColabDownloader.py` or `ColabChunkedDownloader.py` into one code cell.
+2. Copy the full contents of whichever script you want to run (`ColabDownloader.py`, `ColabChunkedDownloader.py`, `ColabYTDownloader.py`, or `ColabChunkedYTDownloader.py`) into one code cell.
 3. Edit the settings at the top of the script.
 4. Run the cell.
 5. Approve Google Drive access when Colab asks.
 6. Follow the prompts printed by the script.
+
+The two `yt-dlp` scripts automatically install `yt-dlp` and `ffmpeg` inside Colab if they are missing.
 
 ### Settings to edit in `ColabDownloader.py`
 
@@ -54,6 +63,38 @@ Default output location:
 
 ```python
 DRIVE_OUTPUT_ROOT = "/content/drive/MyDrive/ColabChunkDownloads"
+```
+
+### Settings to edit in `ColabYTDownloader.py`
+
+- `URL`: video or media page URL supported by `yt-dlp`.
+- `COOKIES_TEXT`: optional cookies pasted either as Netscape cookie-file text or as a normal `Cookie:` header string.
+- `QUALITY`: optional height cap such as `720` or `1080`; leave `None` for the best available result.
+- `YT_DLP_FORMAT`: optional raw `yt-dlp` format selector; when set, it overrides `QUALITY`.
+- `MERGE_OUTPUT_FORMAT`: merged container format such as `mp4`.
+- `DRIVE_OUTPUT_DIR`: where the uploaded file or parts should be stored in Drive.
+- `LOCAL_WORK_DIR`: temporary working directory inside the Colab VM.
+
+Default output location:
+
+```python
+DRIVE_OUTPUT_DIR = "/content/drive/MyDrive/ColabYTDownloads"
+```
+
+### Settings to edit in `ColabChunkedYTDownloader.py`
+
+- `URL`: video or media page URL supported by `yt-dlp`.
+- `COOKIES_TEXT`: optional cookies pasted either as Netscape cookie-file text or as a normal `Cookie:` header string.
+- `QUALITY`: optional height cap such as `720` or `1080`; leave `None` for the best available result.
+- `YT_DLP_FORMAT`: optional raw `yt-dlp` format selector; when set, it overrides `QUALITY`.
+- `SPLIT_PART_INDEX`: which Drive batch to generate on this run.
+- `DRIVE_OUTPUT_ROOT`: root Drive folder for chunk batches.
+- `LOCAL_WORK_ROOT`: temporary working directory inside the Colab VM.
+
+Default output location:
+
+```python
+DRIVE_OUTPUT_ROOT = "/content/drive/MyDrive/ColabChunkYTDownloads"
 ```
 
 ## What each script uploads to Google Drive
@@ -87,6 +128,23 @@ Typical loop for large files:
 3. Download that Drive folder to your own machine with `rclone` or `gdrivedl`.
 4. Return to Colab, confirm the batch, then set `SPLIT_PART_INDEX = 2`.
 5. Repeat until all split parts are finished.
+
+### `ColabYTDownloader.py`
+
+- Downloads one item with `yt-dlp` using the selected cookies and quality settings.
+- If the downloaded media is within the size threshold, it uploads one file to `DRIVE_OUTPUT_DIR`.
+- If the downloaded media is larger than `MAX_SINGLE_FILE_BYTES`, it splits that local file into `filename.part0001-of-0004` style files and uploads those parts plus a manifest.
+
+### `ColabChunkedYTDownloader.py`
+
+- Downloads one item with `yt-dlp` using the selected cookies and quality settings.
+- Then, for the current `SPLIT_PART_INDEX`, it creates `chunk########-of-########` files and uploads that split folder to Drive.
+- It also uploads a split manifest such as `filename.split_0001.manifest.json`.
+
+Important note for the `yt-dlp` chunked workflow:
+
+- `ColabChunkedYTDownloader.py` first downloads the complete media file into the Colab VM, and only then chunks it for Drive.
+- That means the Colab VM still needs enough local space for the downloaded media file itself.
 
 ## Downloading the uploaded Drive files after the Colab run
 
@@ -144,7 +202,42 @@ rclone lsf 'mydrive:ColabDownloads'
 rclone lsf 'mydrive:ColabChunkDownloads/your-file'
 ```
 
-### 4. Use the domain-fronting `rclone` fork when needed
+### 4. Download the output of `ColabYTDownloader.py`
+
+If you kept the default Drive folder:
+
+```bash
+rclone copy 'mydrive:ColabYTDownloads' ./ColabYTDownloads -P
+```
+
+To download only one specific media file or part:
+
+```bash
+rclone copy 'mydrive:ColabYTDownloads/your-video.part0001-of-0004' . -P
+```
+
+### 5. Download the output of `ColabChunkedYTDownloader.py`
+
+Download a single split folder:
+
+```bash
+rclone copy 'mydrive:ColabChunkYTDownloads/your-video/split_0001' ./split_0001 -P
+```
+
+Download the whole chunked folder tree:
+
+```bash
+rclone copy 'mydrive:ColabChunkYTDownloads/your-video' ./your-video -P
+```
+
+Useful helper commands:
+
+```bash
+rclone lsf 'mydrive:ColabYTDownloads'
+rclone lsf 'mydrive:ColabChunkYTDownloads/your-video'
+```
+
+### 6. Use the domain-fronting `rclone` fork when needed
 
 If direct access to Google Drive or Google APIs is filtered on your network, you can use the domain-fronting fork at `https://github.com/aleskxyz/rclone`.
 
@@ -175,7 +268,7 @@ Example:
   --fronting-domains '*.googleapis.com,*.google.com,*.googleusercontent.com'
 ```
 
-Use the same flags with the chunked-folder commands from the previous steps if you are downloading `ColabChunkDownloads` instead.
+Use the same flags with the other `copy` commands above if you are downloading `ColabChunkDownloads`, `ColabYTDownloads`, or `ColabChunkYTDownloads` instead.
 
 Whether domain fronting works depends on your current network path and Google's current edge behavior.
 
@@ -220,7 +313,7 @@ Or install it directly:
 go install github.com/hadi77ir/gdrivedl@latest
 ```
 
-### 3. Download a shared folder produced by `ColabChunkedDownloader.py`
+### 3. Download a shared folder produced by `ColabChunkedDownloader.py` or `ColabChunkedYTDownloader.py`
 
 Public shared folders can be downloaded directly:
 
@@ -228,9 +321,9 @@ Public shared folders can be downloaded directly:
 gdrivedl -u 'https://drive.google.com/drive/folders/FOLDER_ID?usp=sharing'
 ```
 
-That is the most natural match for `split_0001`, `split_0002`, and the other batch folders.
+That is the most natural match for `split_0001`, `split_0002`, and the other batch folders from either chunked workflow.
 
-### 4. Download a shared file or one part produced by `ColabDownloader.py`
+### 4. Download a shared file or one part produced by `ColabDownloader.py` or `ColabYTDownloader.py`
 
 ```bash
 gdrivedl -u 'https://drive.google.com/file/d/FILE_ID/view?usp=sharing'
@@ -275,7 +368,7 @@ Whether domain fronting works depends on your current network path and Google's 
 
 ## Rebuilding files after you download them locally
 
-### Rebuild parts from `ColabDownloader.py`
+### Rebuild parts from `ColabDownloader.py` or `ColabYTDownloader.py`
 
 After you download all `.part####` files plus the manifest, place them in one folder and concatenate them in order.
 
@@ -287,7 +380,7 @@ cat your-file.part0001-of-0004 your-file.part0002-of-0004 your-file.part0003-of-
 
 Use the `*.manifest.json` file if you need the exact rebuild order.
 
-### Rebuild chunks from `ColabChunkedDownloader.py`
+### Rebuild chunks from `ColabChunkedDownloader.py` or `ColabChunkedYTDownloader.py`
 
 After you download all `split_####` folders, place all chunk files in one directory and rebuild the original file.
 
@@ -305,6 +398,7 @@ The chunk numbers are zero-padded, so normal alphabetical order is the correct r
 - If you need domain fronting with `google.com`, use `gdrivedl` or the `https://github.com/aleskxyz/rclone` fork.
 - Prefer `gdrivedl` if you want a clean shared-link download workflow for a file or folder.
 - For very large downloads, `ColabChunkedDownloader.py` is the safer workflow because each run only handles one Drive-sized batch.
+- Use `ColabChunkedYTDownloader.py` only when the Colab VM has enough local space for the full media file before chunking.
 - Do not rename part or chunk files unless you preserve their ordering.
 
 
