@@ -34,7 +34,7 @@ These scripts are already written for Colab and mount Google Drive themselves wi
 
 The `yt-dlp` script automatically installs `yt-dlp` and `ffmpeg` inside Colab if they are missing.
 
-All four scripts now follow the same interaction pattern:
+All three scripts now follow the same interaction pattern:
 
 - They do not ask questions before finishing the current file, part, or split upload.
 - They download with multiple connections when supported by the source workflow, otherwise they fall back to one connection.
@@ -66,7 +66,8 @@ DRIVE_OUTPUT_DIR = "/content/drive/MyDrive/ColabDownloads"
 - `LOCAL_WORK_ROOT`: temporary working directory inside the Colab VM.
 - `CHUNK_SIZE_BYTES`: size of each chunk file.
 - `MAX_LOCAL_BATCH_BYTES`: maximum local batch size before you download the next batch in another run.
-- `CHUNK_DOWNLOAD_CONNECTIONS`: number of parallel HTTP connections to use when a chunk is large enough and the server supports Range requests.
+- `SPLIT_DOWNLOAD_CONNECTIONS`: number of parallel HTTP Range requests to use for the current split.
+- `ENABLE_REDOWNLOAD`: if `False`, matching local chunk files and matching Drive chunk files are reused; if `True`, the current split is redownloaded and reuploaded.
 
 Default output location:
 
@@ -115,16 +116,18 @@ Large-file mode needs a server that supports HTTP Range requests so Colab can fe
 ```
 
 - That folder contains the chunk files plus a split manifest such as `filename.split_0001.manifest.json`.
+- The split download itself is optimized per split, not per chunk: the script divides the split byte range across workers, each worker sends one HTTP Range request, and each worker writes its streamed bytes directly into the final chunk files.
+- If a local chunk file already exists with the expected size, it is reused and skipped unless `ENABLE_REDOWNLOAD = True`.
+- If a local chunk file has the wrong size, the script attempts a semi-resume when possible for the first incomplete chunk of a worker request; otherwise it redownloads that chunk data.
 - After each split upload, the script removes the local temporary files, asks whether you already downloaded that Drive split, removes the Drive split if you confirm, and optionally continues to the next split.
-
-Chunk downloads use multiple connections only when the current chunk is large enough and the source supports HTTP Range.
 
 ### `ColabYTDownloader.py`
 
 - Downloads one item with `yt-dlp` using the selected cookies and quality settings.
 - If the downloaded media is within the size threshold, it uploads one file to `DRIVE_OUTPUT_DIR`.
 - If the downloaded media is larger than `MAX_SINGLE_FILE_BYTES`, it processes `filename.part0001-of-0004` style parts starting from `START_PART_INDEX`.
-- `yt-dlp` uses concurrent fragment downloads when the selected site and format support it.
+- The media download step itself is handled by `yt-dlp`.
+- `yt-dlp` may use concurrent fragment downloads when the selected site and format support it.
 - After each large-file upload, the script removes the local temporary part, asks whether you already downloaded the Drive copy, removes that Drive copy if you confirm, and optionally continues to the next part.
 
 ## Downloading the uploaded Drive files after the Colab run

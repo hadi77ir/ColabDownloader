@@ -1,8 +1,12 @@
 # ============================================================
 # Colab URL downloader -> Google Drive chunk batch uploader
 # Downloads a direct URL in Drive-sized split batches of chunk files.
-# Each split is uploaded, cleaned locally, then optionally removed
-# from Drive after you confirm you downloaded it.
+#
+# Split download model:
+#   - One split covers a contiguous byte range of the remote file.
+#   - The split range is divided across several workers.
+#   - Each worker issues exactly one HTTP Range request.
+#   - Each worker writes its streamed response directly into the final chunk files.
 # ============================================================
 
 import json
@@ -36,14 +40,18 @@ CHUNK_SIZE_BYTES = 10_000_000
 MAX_LOCAL_BATCH_BYTES = 10_000_000_000
 CHUNKS_PER_SPLIT_PART = MAX_LOCAL_BATCH_BYTES // CHUNK_SIZE_BYTES
 
-# When Range is supported and a chunk is large enough, fetch it over several
-# connections and assemble it locally before upload.
-CHUNK_DOWNLOAD_CONNECTIONS = 4
+# Number of concurrent split-range requests.
+SPLIT_DOWNLOAD_CONNECTIONS = 4
+
+# If False, an existing local chunk with the expected size is reused and a
+# matching Drive chunk is skipped. If True, the current split is redownloaded
+# and reuploaded from scratch.
+ENABLE_REDOWNLOAD = False
 
 DELETE_LOCAL_BATCH_AFTER_UPLOAD = True
 MAX_RETRIES = 5
 REQUEST_STREAM_BYTES = 2 * 1024 * 1024
-MIN_PARALLEL_SEGMENT_BYTES = 64 * 1024 * 1024
+MIN_REQUEST_BYTES = 64 * 1024 * 1024
 
 REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 ColabChunkDownloader/1.0",
@@ -85,13 +93,13 @@ def safe_filename(name):
 
 
 def filename_from_headers_or_url(headers, url):
-    cd = headers.get("content-disposition", "")
+    content_disposition = headers.get("content-disposition", "")
 
-    match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", cd, flags=re.I)
+    match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", content_disposition, flags=re.I)
     if match:
         return safe_filename(unquote(match.group(1)))
 
-    match = re.search(r'filename\s*=\s*"?([^";]+)"?', cd, flags=re.I)
+    match = re.search(r'filename\s*=\s*"?([^";]+)"?', content_disposition, flags=re.I)
     if match:
         return safe_filename(unquote(match.group(1)))
 
@@ -182,223 +190,19 @@ def chunk_name(filename, global_chunk_index, total_chunks):
     return f"{filename}.chunk{global_chunk_index:08d}-of-{total_chunks:08d}"
 
 
-def build_subranges(start, end, connections):
-    total = end - start + 1
-
-    if connections <= 1 or total < MIN_PARALLEL_SEGMENT_BYTES:
-        return [(0, start, end)]
-
-    max_connections = max(1, min(connections, total // MIN_PARALLEL_SEGMENT_BYTES))
-    if max_connections == 1:
-        return [(0, start, end)]
-
-    ranges = []
-    base = total // max_connections
-    extra = total % max_connections
-    cursor = start
-
-    for index in range(max_connections):
-        size = base + (1 if index < extra else 0)
-        seg_start = cursor
-        seg_end = cursor + size - 1
-        ranges.append((index, seg_start, seg_end))
-        cursor = seg_end + 1
-
-    return ranges
+def size_matches(path, expected_size):
+    path = Path(path)
+    return path.exists() and path.is_file() and path.stat().st_size == expected_size
 
 
-def download_subrange(url, start, end, temp_path):
-    temp_path = Path(temp_path)
-    expected = end - start + 1
-    temp_path.parent.mkdir(parents=True, exist_ok=True)
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        have = temp_path.stat().st_size if temp_path.exists() else 0
-
-        if have > expected:
-            temp_path.unlink()
-            have = 0
-
-        if have == expected:
-            return temp_path
-
-        headers = dict(REQUEST_HEADERS)
-        headers["Range"] = f"bytes={start + have}-{end}"
-
-        try:
-            with requests.get(
-                url,
-                headers=headers,
-                stream=True,
-                allow_redirects=True,
-                timeout=(30, 120),
-            ) as response:
-                if response.status_code != 206:
-                    raise RuntimeError(
-                        f"Expected HTTP 206 Partial Content, got HTTP {response.status_code}."
-                    )
-
-                with open(temp_path, "ab") as file_obj:
-                    for block in response.iter_content(chunk_size=REQUEST_STREAM_BYTES):
-                        if block:
-                            file_obj.write(block)
-
-            if temp_path.stat().st_size == expected:
-                return temp_path
-
-            raise RuntimeError(
-                f"Incomplete segment {temp_path.name}: got {temp_path.stat().st_size}, expected {expected}"
-            )
-
-        except Exception as exc:
-            print(f"Segment attempt {attempt}/{MAX_RETRIES} failed for {temp_path.name}: {exc}")
-            if attempt == MAX_RETRIES:
-                raise
-            time.sleep(min(30, 2 ** attempt))
-
-    raise RuntimeError(f"Could not download {temp_path.name}")
-
-
-def assemble_segments(segment_paths, local_path, expected_size):
-    local_path = Path(local_path)
-    tmp_path = Path(str(local_path) + ".partial")
-    remove_path(tmp_path)
-
-    written = 0
-    last_print = 0
-
-    with open(tmp_path, "wb") as output_file:
-        for segment_path in segment_paths:
-            with open(segment_path, "rb") as input_file:
-                while True:
-                    block = input_file.read(REQUEST_STREAM_BYTES)
-                    if not block:
-                        break
-
-                    output_file.write(block)
-                    written += len(block)
-
-                    now = time.time()
-                    if now - last_print > 1 or written == expected_size:
-                        print(
-                            f"\rAssemble: {human_size(written)} / {human_size(expected_size)}",
-                            end="",
-                            flush=True,
-                        )
-                        last_print = now
-
-    print()
-    tmp_path.rename(local_path)
-
-
-def download_range_single_connection(session, url, start, end, local_path):
-    local_path = Path(local_path)
-    tmp_path = Path(str(local_path) + ".partial")
-    expected = end - start + 1
-
-    if local_path.exists() and local_path.stat().st_size == expected:
-        return "already-local"
-
-    if local_path.exists():
-        local_path.unlink()
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        have = tmp_path.stat().st_size if tmp_path.exists() else 0
-
-        if have > expected:
-            tmp_path.unlink()
-            have = 0
-
-        if have == expected:
-            tmp_path.rename(local_path)
-            return "completed-from-partial"
-
-        headers = dict(REQUEST_HEADERS)
-        headers["Range"] = f"bytes={start + have}-{end}"
-
-        try:
-            with session.get(
-                url,
-                headers=headers,
-                stream=True,
-                allow_redirects=True,
-                timeout=(30, 120),
-            ) as response:
-                if response.status_code != 206:
-                    raise RuntimeError(
-                        f"Expected HTTP 206 Partial Content, got HTTP {response.status_code}."
-                    )
-
-                with open(tmp_path, "ab") as file_obj:
-                    for block in response.iter_content(chunk_size=REQUEST_STREAM_BYTES):
-                        if block:
-                            file_obj.write(block)
-                            have += len(block)
-
-            if tmp_path.stat().st_size == expected:
-                tmp_path.rename(local_path)
-                return "downloaded"
-
-        except Exception as exc:
-            print(f"Chunk download attempt {attempt}/{MAX_RETRIES} failed: {exc}")
-            if attempt == MAX_RETRIES:
-                raise
-            time.sleep(min(30, 2 ** attempt))
-
-    raise RuntimeError(f"Could not download {local_path.name}")
-
-
-def download_range_to_file(session, url, start, end, local_path, range_supported, connections):
-    local_path = Path(local_path)
-    expected = end - start + 1
-
-    if local_path.exists() and local_path.stat().st_size == expected:
-        return "already-local"
-
-    if local_path.exists():
-        local_path.unlink()
-
-    subranges = build_subranges(start, end, connections if range_supported else 1)
-    if len(subranges) == 1:
-        return download_range_single_connection(session, url, start, end, local_path)
-
-    print(f"Downloading {local_path.name} over {len(subranges)} connections...")
-
-    segment_dir = Path(str(local_path) + ".segments")
-    segment_dir.mkdir(parents=True, exist_ok=True)
-
-    try:
-        with ThreadPoolExecutor(max_workers=len(subranges)) as executor:
-            futures = []
-            for index, seg_start, seg_end in subranges:
-                segment_path = segment_dir / f"segment_{index:03d}.partial"
-                futures.append(executor.submit(download_subrange, url, seg_start, seg_end, segment_path))
-
-            for future in as_completed(futures):
-                future.result()
-
-        ordered_paths = [segment_dir / f"segment_{index:03d}.partial" for index, _, _ in subranges]
-        assemble_segments(ordered_paths, local_path, expected)
-
-    finally:
-        shutil.rmtree(segment_dir, ignore_errors=True)
-
-    if local_path.stat().st_size != expected:
-        raise RuntimeError(
-            f"Chunk size mismatch for {local_path.name}: got {local_path.stat().st_size}, expected {expected}"
-        )
-
-    return "downloaded"
-
-
-def copy_file_to_drive(local_path, drive_path):
+def copy_file_to_drive(local_path, drive_path, force_upload=False):
     local_path = Path(local_path)
     drive_path = Path(drive_path)
     drive_path.parent.mkdir(parents=True, exist_ok=True)
 
     expected_size = local_path.stat().st_size
 
-    if drive_path.exists() and drive_path.stat().st_size == expected_size:
+    if not force_upload and size_matches(drive_path, expected_size):
         return "already-drive"
 
     if drive_path.exists():
@@ -449,7 +253,7 @@ def write_manifest(
         "notes": [
             "Chunk files are zero-padded, so alphabetical order is the rebuild order.",
             "Download all split folders from Google Drive before rebuilding.",
-            "Do not rename chunk files unless you preserve their ordering.",
+            "Matching local chunk files are reused unless ENABLE_REDOWNLOAD is set to True.",
         ],
     }
 
@@ -460,6 +264,302 @@ def write_manifest(
         json.dump(manifest, file_obj, indent=2)
 
     return manifest_path
+
+
+def build_split_chunk_infos(
+    filename,
+    total_chunks,
+    total_size,
+    start_chunk,
+    end_chunk,
+    local_split_dir,
+    drive_split_dir,
+):
+    chunk_infos = []
+
+    for global_chunk_index in range(start_chunk, end_chunk + 1):
+        chunk_start = (global_chunk_index - 1) * CHUNK_SIZE_BYTES
+        chunk_end = min(global_chunk_index * CHUNK_SIZE_BYTES, total_size) - 1
+        expected_size = chunk_end - chunk_start + 1
+        name = chunk_name(filename, global_chunk_index, total_chunks)
+
+        chunk_infos.append(
+            {
+                "chunk_index": global_chunk_index,
+                "name": name,
+                "start_byte": chunk_start,
+                "end_byte": chunk_end,
+                "expected_size": expected_size,
+                "local_path": Path(local_split_dir) / name,
+                "drive_path": Path(drive_split_dir) / name,
+            }
+        )
+
+    return chunk_infos
+
+
+def prepare_chunk_states(chunk_infos):
+    states = []
+
+    for chunk in chunk_infos:
+        state = dict(chunk)
+        local_path = state["local_path"]
+        drive_path = state["drive_path"]
+        expected_size = state["expected_size"]
+
+        if ENABLE_REDOWNLOAD:
+            remove_path(local_path)
+            state["drive_ready"] = False
+            state["local_size"] = 0
+            state["local_ready"] = False
+            state["needs_download"] = True
+            states.append(state)
+            continue
+
+        state["drive_ready"] = size_matches(drive_path, expected_size)
+
+        local_size = 0
+        if local_path.exists():
+            local_size = local_path.stat().st_size
+
+            if local_size > expected_size:
+                print(f"Deleting oversized local chunk: {local_path.name}")
+                local_path.unlink()
+                local_size = 0
+
+        state["local_size"] = local_size
+        state["local_ready"] = local_size == expected_size
+        state["needs_download"] = (not state["drive_ready"]) and (local_size < expected_size)
+        states.append(state)
+
+    return states
+
+
+def build_download_runs(states):
+    runs = []
+    current_run = []
+    previous_chunk_index = None
+
+    for state in states:
+        if not state["needs_download"]:
+            if current_run:
+                runs.append(current_run)
+                current_run = []
+            previous_chunk_index = None
+            continue
+
+        starts_with_partial = state["local_size"] > 0
+
+        if current_run:
+            contiguous = state["chunk_index"] == previous_chunk_index + 1
+            if (not contiguous) or starts_with_partial:
+                runs.append(current_run)
+                current_run = []
+
+        current_run.append(state)
+        previous_chunk_index = state["chunk_index"]
+
+    if current_run:
+        runs.append(current_run)
+
+    return runs
+
+
+def split_contiguous_run(run, max_request_count):
+    if not run:
+        return []
+
+    remaining_bytes = run[-1]["end_byte"] - (run[0]["start_byte"] + run[0]["local_size"]) + 1
+    if remaining_bytes <= 0:
+        return []
+
+    desired_request_count = 1
+    if len(run) > 1 and remaining_bytes >= MIN_REQUEST_BYTES:
+        desired_request_count = min(max_request_count, len(run))
+
+    groups = []
+    base = len(run) // desired_request_count
+    extra = len(run) % desired_request_count
+    cursor = 0
+
+    for index in range(desired_request_count):
+        group_size = base + (1 if index < extra else 0)
+        group = run[cursor: cursor + group_size]
+        if group:
+            groups.append(group)
+        cursor += group_size
+
+    return groups
+
+
+def build_download_tasks(states):
+    tasks = []
+    task_counter = 1
+    runs = build_download_runs(states)
+
+    for run in runs:
+        groups = split_contiguous_run(run, SPLIT_DOWNLOAD_CONNECTIONS)
+        for group in groups:
+            first_chunk = group[0]
+            start_byte = first_chunk["start_byte"] + first_chunk["local_size"]
+            end_byte = group[-1]["end_byte"]
+
+            tasks.append(
+                {
+                    "task_number": task_counter,
+                    "chunk_start_index": group[0]["chunk_index"],
+                    "chunk_end_index": group[-1]["chunk_index"],
+                    "start_byte": start_byte,
+                    "end_byte": end_byte,
+                    "chunks": group,
+                }
+            )
+            task_counter += 1
+
+    return tasks
+
+
+def download_task_to_chunks(url, task):
+    headers = dict(REQUEST_HEADERS)
+    headers["Range"] = f"bytes={task['start_byte']}-{task['end_byte']}"
+    expected_total = task["end_byte"] - task["start_byte"] + 1
+
+    print(
+        f"Request {task['task_number']}: chunks {task['chunk_start_index']}-{task['chunk_end_index']} "
+        f"bytes {task['start_byte']}-{task['end_byte']} ({human_size(expected_total)})"
+    )
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        bytes_written = 0
+        current_file = None
+
+        try:
+            chunks = task["chunks"]
+            chunk_position = 0
+            current_chunk = chunks[chunk_position]
+            current_written = current_chunk["local_size"]
+            current_target = current_chunk["expected_size"]
+
+            current_chunk["local_path"].parent.mkdir(parents=True, exist_ok=True)
+            current_file = open(
+                current_chunk["local_path"],
+                "ab" if current_written > 0 else "wb",
+            )
+
+            with requests.get(
+                url,
+                headers=headers,
+                stream=True,
+                allow_redirects=True,
+                timeout=(30, 120),
+            ) as response:
+                if response.status_code != 206:
+                    raise RuntimeError(
+                        f"Expected HTTP 206 Partial Content, got HTTP {response.status_code}."
+                    )
+
+                for block in response.iter_content(chunk_size=REQUEST_STREAM_BYTES):
+                    if not block:
+                        continue
+
+                    view = memoryview(block)
+
+                    while view:
+                        remaining_in_chunk = current_target - current_written
+                        piece = view[:remaining_in_chunk]
+                        current_file.write(piece)
+                        current_written += len(piece)
+                        bytes_written += len(piece)
+                        view = view[len(piece):]
+
+                        if current_written == current_target:
+                            current_file.close()
+                            current_file = None
+                            chunk_position += 1
+
+                            if chunk_position == len(chunks):
+                                if view:
+                                    raise RuntimeError("Received more bytes than expected for the task.")
+                                break
+
+                            current_chunk = chunks[chunk_position]
+                            current_written = current_chunk["local_size"]
+                            current_target = current_chunk["expected_size"]
+                            if current_written != 0:
+                                raise RuntimeError(
+                                    f"Only the first chunk in a request may resume, but {current_chunk['name']} has partial data."
+                                )
+
+                            current_chunk["local_path"].parent.mkdir(parents=True, exist_ok=True)
+                            current_file = open(current_chunk["local_path"], "wb")
+
+            if current_file is not None:
+                current_file.close()
+                current_file = None
+
+            if bytes_written != expected_total:
+                raise RuntimeError(
+                    f"Incomplete request {task['task_number']}: got {bytes_written}, expected {expected_total}"
+                )
+
+            for chunk in task["chunks"]:
+                if not size_matches(chunk["local_path"], chunk["expected_size"]):
+                    raise RuntimeError(
+                        f"Chunk size mismatch for {chunk['name']}: "
+                        f"got {chunk['local_path'].stat().st_size if chunk['local_path'].exists() else 'missing'}, "
+                        f"expected {chunk['expected_size']}"
+                    )
+
+            print(f"Request {task['task_number']} completed.")
+            return
+
+        except Exception as exc:
+            if current_file is not None:
+                current_file.close()
+
+            print(f"Request {task['task_number']} attempt {attempt}/{MAX_RETRIES} failed: {exc}")
+            if attempt == MAX_RETRIES:
+                raise
+            time.sleep(min(30, 2 ** attempt))
+
+
+def download_split_to_local_chunks(final_url, states):
+    drive_ready_count = sum(1 for state in states if state["drive_ready"])
+    local_ready_count = sum(
+        1 for state in states
+        if (not state["drive_ready"]) and state["local_ready"]
+    )
+    partial_count = sum(
+        1 for state in states
+        if (not state["drive_ready"]) and 0 < state["local_size"] < state["expected_size"]
+    )
+    missing_count = sum(1 for state in states if state["needs_download"] and state["local_size"] == 0)
+
+    print(f"Drive-ready chunks: {drive_ready_count}")
+    print(f"Local-ready chunks: {local_ready_count}")
+    print(f"Partial local chunks: {partial_count}")
+    print(f"Missing chunks: {missing_count}")
+
+    tasks = build_download_tasks(states)
+    if not tasks:
+        print("No chunk downloads are needed for this split.")
+        return
+
+    print(f"Launching {len(tasks)} split-range request(s) with up to {SPLIT_DOWNLOAD_CONNECTIONS} concurrent worker(s)...")
+
+    with ThreadPoolExecutor(max_workers=min(SPLIT_DOWNLOAD_CONNECTIONS, len(tasks))) as executor:
+        futures = [executor.submit(download_task_to_chunks, final_url, task) for task in tasks]
+        for future in as_completed(futures):
+            future.result()
+
+    for state in states:
+        if state["drive_ready"]:
+            continue
+
+        if not size_matches(state["local_path"], state["expected_size"]):
+            raise RuntimeError(
+                f"Local chunk is incomplete after split download: {state['name']}"
+            )
 
 
 def handle_drive_cleanup(drive_split_dir, current_split, total_split_parts):
@@ -497,8 +597,8 @@ def main():
     if CHUNKS_PER_SPLIT_PART < 1:
         raise ValueError("CHUNKS_PER_SPLIT_PART must be at least 1.")
 
-    if CHUNK_DOWNLOAD_CONNECTIONS < 1:
-        raise ValueError("CHUNK_DOWNLOAD_CONNECTIONS must be at least 1.")
+    if SPLIT_DOWNLOAD_CONNECTIONS < 1:
+        raise ValueError("SPLIT_DOWNLOAD_CONNECTIONS must be at least 1.")
 
     print("Mounting Google Drive...")
     drive.mount("/content/drive")
@@ -516,14 +616,15 @@ def main():
     total_size = info["size"]
     range_supported = info["range_supported"]
 
-    print(f"Filename:         {filename}")
-    print(f"Final URL:        {final_url}")
-    print(f"Remote size:      {human_size(total_size)}")
-    print(f"Range support:    {range_supported}")
-    print(f"Chunk size:       {human_size(CHUNK_SIZE_BYTES)}")
-    print(f"Chunks/split:     {CHUNKS_PER_SPLIT_PART}")
-    print(f"Start split:      {SPLIT_PART_INDEX}")
-    print(f"Connections:      {CHUNK_DOWNLOAD_CONNECTIONS}")
+    print(f"Filename:              {filename}")
+    print(f"Final URL:             {final_url}")
+    print(f"Remote size:           {human_size(total_size)}")
+    print(f"Range support:         {range_supported}")
+    print(f"Chunk size:            {human_size(CHUNK_SIZE_BYTES)}")
+    print(f"Chunks/split:          {CHUNKS_PER_SPLIT_PART}")
+    print(f"Start split:           {SPLIT_PART_INDEX}")
+    print(f"Split connections:     {SPLIT_DOWNLOAD_CONNECTIONS}")
+    print(f"Enable redownload:     {ENABLE_REDOWNLOAD}")
 
     if total_size is None:
         raise RuntimeError(
@@ -564,69 +665,54 @@ def main():
 
         print("\nPlanned split part")
         print("------------------")
-        print(f"Split part:       {current_split} of {total_split_parts}")
-        print(f"Chunks:           {start_chunk} through {end_chunk}")
-        print(f"Chunk count:      {batch_chunk_count}")
-        print(f"Byte range:       {start_byte} through {end_byte}")
-        print(f"Batch size:       {human_size(batch_size)}")
-        print(f"Local folder:     {local_split_dir}")
-        print(f"Drive folder:     {drive_split_dir}")
+        print(f"Split part:           {current_split} of {total_split_parts}")
+        print(f"Chunks:               {start_chunk} through {end_chunk}")
+        print(f"Chunk count:          {batch_chunk_count}")
+        print(f"Byte range:           {start_byte} through {end_byte}")
+        print(f"Batch size:           {human_size(batch_size)}")
+        print(f"Local folder:         {local_split_dir}")
+        print(f"Drive folder:         {drive_split_dir}")
 
-        print("\nDownloading chunks into the Colab filesystem...")
+        split_chunks = build_split_chunk_infos(
+            filename=filename,
+            total_chunks=total_chunks,
+            total_size=total_size,
+            start_chunk=start_chunk,
+            end_chunk=end_chunk,
+            local_split_dir=local_split_dir,
+            drive_split_dir=drive_split_dir,
+        )
+        chunk_states = prepare_chunk_states(split_chunks)
 
-        for global_chunk_index in range(start_chunk, end_chunk + 1):
-            chunk_start = (global_chunk_index - 1) * CHUNK_SIZE_BYTES
-            chunk_end = min(global_chunk_index * CHUNK_SIZE_BYTES, total_size) - 1
-            expected = chunk_end - chunk_start + 1
-
-            name = chunk_name(filename, global_chunk_index, total_chunks)
-            local_chunk = local_split_dir / name
-            drive_chunk = drive_split_dir / name
-
-            if drive_chunk.exists() and drive_chunk.stat().st_size == expected:
-                if global_chunk_index == start_chunk or global_chunk_index % 25 == 0:
-                    print(f"Drive already has chunk {global_chunk_index}/{total_chunks}; skipping local download.")
-                continue
-
-            status = download_range_to_file(
-                session=session,
-                url=final_url,
-                start=chunk_start,
-                end=chunk_end,
-                local_path=local_chunk,
-                range_supported=range_supported,
-                connections=CHUNK_DOWNLOAD_CONNECTIONS,
-            )
-
-            if (
-                global_chunk_index == start_chunk
-                or global_chunk_index == end_chunk
-                or global_chunk_index % 25 == 0
-            ):
-                done_in_batch = global_chunk_index - start_chunk + 1
-                print(
-                    f"Chunk {global_chunk_index}/{total_chunks} ({done_in_batch}/{batch_chunk_count}) {status}: {local_chunk.name}"
-                )
-
-        local_chunks = sorted(local_split_dir.glob(f"{filename}.chunk*-of-{total_chunks:08d}"))
+        print("\nDownloading the split range into chunk files...")
+        download_split_to_local_chunks(final_url, chunk_states)
 
         print("\nCopying chunks to Google Drive...")
         uploaded = 0
         already = 0
+        skipped_drive = 0
 
-        for index, local_chunk in enumerate(local_chunks, start=1):
-            drive_chunk = drive_split_dir / local_chunk.name
-            status = copy_file_to_drive(local_chunk, drive_chunk)
+        chunks_to_upload = [state for state in chunk_states if ENABLE_REDOWNLOAD or not state["drive_ready"]]
+
+        for index, state in enumerate(chunks_to_upload, start=1):
+            status = copy_file_to_drive(
+                local_path=state["local_path"],
+                drive_path=state["drive_path"],
+                force_upload=ENABLE_REDOWNLOAD,
+            )
 
             if status == "uploaded":
                 uploaded += 1
             else:
                 already += 1
 
-            if index == 1 or index == len(local_chunks) or index % 25 == 0:
+            if index == 1 or index == len(chunks_to_upload) or index % 25 == 0:
                 print(
-                    f"Drive copy progress: {index}/{len(local_chunks)} (uploaded={uploaded}, already={already})"
+                    f"Drive copy progress: {index}/{len(chunks_to_upload)} "
+                    f"(uploaded={uploaded}, already={already})"
                 )
+
+        skipped_drive = sum(1 for state in chunk_states if state["drive_ready"] and not ENABLE_REDOWNLOAD)
 
         local_manifest = write_manifest(
             manifest_path=local_split_dir / f"{filename}.split_{current_split:04d}.manifest.json",
@@ -642,13 +728,14 @@ def main():
             total_chunks=total_chunks,
         )
         drive_manifest = drive_split_dir / local_manifest.name
-        copy_file_to_drive(local_manifest, drive_manifest)
+        copy_file_to_drive(local_manifest, drive_manifest, force_upload=ENABLE_REDOWNLOAD)
 
         print("\nThis split part is now in Google Drive.")
-        print(f"Drive folder: {drive_split_dir}")
-        print(f"Manifest:     {drive_manifest.name}")
-        print(f"Uploaded:     {uploaded}")
-        print(f"Already there:{already}")
+        print(f"Drive folder:          {drive_split_dir}")
+        print(f"Manifest:              {drive_manifest.name}")
+        print(f"Uploaded chunks:       {uploaded}")
+        print(f"Already on Drive:      {already}")
+        print(f"Skipped by Drive match:{skipped_drive}")
 
         if DELETE_LOCAL_BATCH_AFTER_UPLOAD:
             remove_path(local_split_dir)
